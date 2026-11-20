@@ -1,0 +1,45 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+.ipynb_checkpoints/
+
+# Environments / secrets
+.env
+.env.*
+*.key
+*.pem
+
+# Temporary downloaded genomes and checkpoints
+work/
+
+# Generated scientific results
+results/
+
+# Runtime logs
+logs/
+*.log
+
+# Large genomic / prediction files
+*.fa
+*.fasta
+*.fna
+*.fa.gz
+*.fasta.gz
+*.fna.gz
+*.fai
+*.npz
+*.bw
+*.bigWig
+*.bedGraph
+*.bedgraph
+*.zarr/
+*.zip
+
+# Editor / OS
+.vscode/
+.DS_Store
+Thumbs.db
+
+# Accidental temporary file
+/=

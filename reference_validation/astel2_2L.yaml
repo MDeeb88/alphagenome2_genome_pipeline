@@ -1,0 +1,19 @@
+dataset:
+  name: astel2_2L
+  fasta_path: /media/eternus1/nfs/projects/dpanchenko/alphagenome2_pipeline/data/astel2/Astel2_random_2L.fa
+  expected_sequence_length: 10000
+prediction:
+  condition: EFO:0002824
+  output_type: RNA_SEQ
+  assay_title: total RNA-seq
+  imputation_mode: observed
+  endedness: single
+  input_length: 1048576
+  padding: center
+  checkpoint_every: 25
+  max_retries: 3
+  retry_seconds: 5
+  batch_size: 1
+  max_workers: 1
+output:
+  dir: /media/eternus1/nfs/projects/dpanchenko/alphagenome2_pipeline/results/astel2_2L_ag2

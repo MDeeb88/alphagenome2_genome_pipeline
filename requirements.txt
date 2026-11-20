@@ -1,0 +1,12 @@
+alphagenome==2.0.0
+
+numpy
+pandas
+PyYAML
+tqdm
+
+pysam
+pyBigWig
+
+zarr==3.1.6
+numcodecs==0.16.6

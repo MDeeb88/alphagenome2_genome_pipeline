@@ -1,0 +1,36 @@
+{
+  "chromosome": "2L",
+  "chromosome_size": 36251798,
+  "npz_files": 3668,
+  "fasta_plus_records": 1809,
+  "fasta_minus_records": 1859,
+  "total_prediction_bases": 36680000,
+  "covered_bases": 22862105,
+  "coverage_fraction": 0.6306474785057558,
+  "maximum_overlap_depth": 7,
+  "mean_overlap_depth_on_covered_bases": 1.6044016944196522,
+  "overlap_resolution": "mean",
+  "input_track_orientation": "input_sequence",
+  "minus_strand_mapping": "genomic_plus=input_minus[::-1]; genomic_minus=input_plus[::-1]",
+  "tracks": {
+    "covered_bases": 22862105,
+    "coverage_fraction": 0.6306474785057558,
+    "plus": {
+      "min": 3.4457803277376797e-09,
+      "max": 0.3636305704712868,
+      "mean": 0.0034266576943264592
+    },
+    "minus": {
+      "min": 3.3616560646265725e-09,
+      "max": 1.4101688861846924,
+      "mean": 0.0032183672020246485
+    }
+  },
+  "outputs": {
+    "plus_bedgraph": "/media/eternus1/nfs/projects/dpanchenko/alphagenome2_pipeline/results/astel2_2L_ag2/tracks/astel2_2L_totalRNA_plus.bedGraph",
+    "minus_bedgraph": "/media/eternus1/nfs/projects/dpanchenko/alphagenome2_pipeline/results/astel2_2L_ag2/tracks/astel2_2L_totalRNA_minus.bedGraph",
+    "plus_bigwig": "/media/eternus1/nfs/projects/dpanchenko/alphagenome2_pipeline/results/astel2_2L_ag2/tracks/astel2_2L_totalRNA_plus.bw",
+    "minus_bigwig": "/media/eternus1/nfs/projects/dpanchenko/alphagenome2_pipeline/results/astel2_2L_ag2/tracks/astel2_2L_totalRNA_minus.bw",
+    "chrom_sizes": "/media/eternus1/nfs/projects/dpanchenko/alphagenome2_pipeline/results/astel2_2L_ag2/tracks/2L.chrom.sizes"
+  }
+}
