@@ -1,0 +1,10 @@
+{
+  "assay": "ATAC",
+  "condition": "EFO:0001184",
+  "human_control": "Homo_sapiens",
+  "samples_per_genome": 20000,
+  "region_width_bp": 250,
+  "random_seed": 42,
+  "sampling": "uniform over eligible genomic window starts",
+  "missing_values": "excluded from mean; coverage recorded"
+}

@@ -131,7 +131,53 @@ def select_rna_tracks(track_data, cfg):
     )
 
 
-def validate_existing_tile(path, row):
+
+def select_atac_tracks(track_data, cfg):
+    """Select HEK293T ATAC tracks using output metadata."""
+    metadata = track_data.metadata.copy()
+
+    required = {
+        "Assay title",
+        "imputation_mode",
+        "strand",
+    }
+    missing = required - set(metadata.columns)
+
+    if missing:
+        raise RuntimeError(
+            f"ATAC metadata is missing columns: {sorted(missing)}"
+        )
+
+    assay = cfg["alphagenome"]["assay_title"]
+    imputation = cfg["alphagenome"]["imputation_mode"]
+
+    mask = (
+        metadata["Assay title"].eq(assay)
+        & metadata["imputation_mode"].eq(imputation)
+        & metadata["strand"].eq(".")
+    )
+
+    indices = np.flatnonzero(mask.to_numpy()).tolist()
+    selected = metadata.iloc[indices].copy()
+
+    if not indices:
+        raise RuntimeError(
+            "No ATAC tracks match the configuration.\n"
+            f"Requested assay: {assay}\n"
+            f"Requested imputation: {imputation}\n"
+            f"Available metadata:\n"
+            f"{metadata.to_string(index=False)}"
+        )
+
+    if track_data.values.shape[1] != len(metadata):
+        raise RuntimeError(
+            "ATAC channel count does not match metadata."
+        )
+
+    return indices, selected
+
+
+def validate_existing_tile(path, row, cfg):
     if not path.exists():
         return False
 
@@ -160,11 +206,49 @@ def validate_existing_tile(path, row):
                 row["retained_length"]
             )
 
-            if values.shape != (
-                expected_length,
-                2,
+            assay_cfg = cfg["alphagenome"]
+            output_type = assay_cfg.get(
+                "output_type", "RNA_SEQ"
+            ).upper()
+
+            if (
+                values.ndim != 2
+                or values.shape[0] != expected_length
+                or values.shape[1] < 1
             ):
                 return False
+
+            strands = x["track_strands"]
+            if len(strands) != values.shape[1]:
+                return False
+
+            if output_type == "RNA_SEQ":
+                if (
+                    values.shape[1] != 2
+                    or list(strands) != ["+", "-"]
+                ):
+                    return False
+            elif output_type == "ATAC":
+                if any(strand != "." for strand in strands):
+                    return False
+            else:
+                return False
+
+            if "output_type" in x.files:
+                if str(x["output_type"].item()) != output_type:
+                    return False
+            elif output_type != "RNA_SEQ":
+                return False
+
+            for field, expected in (
+                ("condition", assay_cfg["condition"]),
+                ("assay_title", assay_cfg["assay_title"]),
+                ("imputation_mode", assay_cfg["imputation_mode"]),
+            ):
+                if field not in x.files:
+                    return False
+                if str(x[field].item()) != str(expected):
+                    return False
 
             if not np.all(
                 np.isfinite(values)
@@ -256,9 +340,15 @@ def predict_with_retry(
     model,
     sequence,
     condition,
+    output_type,
     max_retries,
     retry_seconds,
 ):
+    requested_output = {
+        "RNA_SEQ": dna_client.OutputType.RNA_SEQ,
+        "ATAC": dna_client.OutputType.ATAC,
+    }[output_type]
+
     last_error = None
 
     for attempt in range(
@@ -271,7 +361,7 @@ def predict_with_retry(
             output = model.predict_sequence(
                 sequence=sequence,
                 requested_outputs=[
-                    dna_client.OutputType.RNA_SEQ
+                    requested_output
                 ],
                 condition=condition,
             )
@@ -367,6 +457,17 @@ def main():
     condition = str(
         cfg["alphagenome"]["condition"]
     )
+
+    output_type = str(
+        cfg["alphagenome"].get(
+            "output_type", "RNA_SEQ"
+        )
+    ).upper()
+
+    if output_type not in {"RNA_SEQ", "ATAC"}:
+        raise ValueError(
+            f"Unsupported output type: {output_type}"
+        )
 
     input_length = int(
         cfg["tiling"]["input_length"]
@@ -502,6 +603,7 @@ def main():
     )
 
     track_indices = None
+    track_strands = None
     selected_metadata = None
 
     new_predictions = 0
@@ -557,6 +659,7 @@ def main():
             if validate_existing_tile(
                 output_path,
                 row,
+                cfg,
             ):
                 reused_predictions += 1
 
@@ -584,61 +687,56 @@ def main():
                     model=model,
                     sequence=sequence,
                     condition=condition,
+                    output_type=output_type,
                     max_retries=max_retries,
                     retry_seconds=retry_seconds,
                 )
             )
 
-            rna = output.rna_seq
+            track_data = (
+                output.rna_seq
+                if output_type == "RNA_SEQ"
+                else output.atac
+            )
+
+            if track_data is None:
+                raise RuntimeError(
+                    f"No {output_type} output returned."
+                )
 
             if track_indices is None:
-                (
-                    plus_idx,
-                    minus_idx,
-                    selected_metadata,
-                ) = select_rna_tracks(
-                    rna,
-                    cfg,
-                )
-
-                track_indices = (
-                    plus_idx,
-                    minus_idx,
-                )
+                if output_type == "RNA_SEQ":
+                    plus_idx, minus_idx, selected_metadata = (
+                        select_rna_tracks(track_data, cfg)
+                    )
+                    track_indices = [plus_idx, minus_idx]
+                    track_strands = ["+", "-"]
+                    selected_metadata = (
+                        track_data.metadata.iloc[track_indices].copy()
+                    )
+                else:
+                    track_indices, selected_metadata = (
+                        select_atac_tracks(track_data, cfg)
+                    )
+                    track_strands = (
+                        selected_metadata["strand"]
+                        .astype(str)
+                        .tolist()
+                    )
 
                 selected_metadata.to_csv(
-                    metadata_dir
-                    / "selected_track_metadata.csv",
+                    metadata_dir / "selected_track_metadata.csv",
                     index=False,
                 )
 
-            plus_idx, minus_idx = (
-                track_indices
-            )
+            crop_start = int(row["crop_start"])
+            crop_end = int(row["crop_end"])
 
-            crop_start = int(
-                row["crop_start"]
-            )
-
-            crop_end = int(
-                row["crop_end"]
-            )
-
-            values = np.stack(
-                [
-                    rna.values[
-                        crop_start:crop_end,
-                        plus_idx,
-                    ],
-                    rna.values[
-                        crop_start:crop_end,
-                        minus_idx,
-                    ],
-                ],
-                axis=1,
-            ).astype(
-                np.float32,
-                copy=False,
+            values = np.asarray(
+                track_data.values[
+                    crop_start:crop_end, :
+                ][:, track_indices],
+                dtype=np.float32,
             )
 
             expected_length = int(
@@ -647,7 +745,7 @@ def main():
 
             if values.shape != (
                 expected_length,
-                2,
+                len(track_indices),
             ):
                 raise RuntimeError(
                     f"Unexpected cropped output "
@@ -666,9 +764,11 @@ def main():
             atomic_save_npz(
                 output_path,
                 values=values,
-                track_strands=np.array(
-                    ["+", "-"]
+                track_strands=np.array(track_strands),
+                track_indices=np.array(
+                    track_indices, dtype=np.int32
                 ),
+                output_type=np.array(output_type),
                 track_orientation=np.array(
                     "genomic_reference"
                 ),
@@ -746,13 +846,7 @@ def main():
                         "imputation_mode"
                     ]
                 ),
-                endedness=np.array(
-                    cfg[
-                        "alphagenome"
-                    ][
-                        "endedness"
-                    ]
-                ),
+                endedness=np.array(cfg["alphagenome"].get("endedness", "")),
                 input_length=np.array(
                     input_length
                 ),
@@ -832,6 +926,7 @@ def main():
         if validate_existing_tile(
             tile_dir / filename,
             row,
+            cfg,
         ):
             valid_tiles += 1
 
@@ -843,16 +938,14 @@ def main():
     run_info = {
         "species_id": args.species,
         "condition": condition,
-        "output_type": "RNA_SEQ",
+        "output_type": output_type,
         "assay_title": cfg[
             "alphagenome"
         ]["assay_title"],
         "imputation_mode": cfg[
             "alphagenome"
         ]["imputation_mode"],
-        "endedness": cfg[
-            "alphagenome"
-        ]["endedness"],
+        "endedness": cfg["alphagenome"].get("endedness", ""),
         "input_length": input_length,
         "planned_tiles": int(
             len(manifest)

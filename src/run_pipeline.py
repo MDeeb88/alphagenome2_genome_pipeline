@@ -76,6 +76,7 @@ def status_for_species(
     results_dir,
     work_dir,
     require_tracks,
+    config=None,
 ):
     result_dir = (
         results_dir
@@ -85,6 +86,22 @@ def status_for_species(
     if final_outputs_complete(
         result_dir,
         require_tracks=require_tracks,
+        expected_output_type=(
+            str(config["alphagenome"].get(
+                "output_type", "RNA_SEQ"
+            )).upper()
+            if config is not None else None
+        ),
+        expected_condition=(
+            str(config["alphagenome"]["condition"])
+            if config is not None else None
+        ),
+        allow_bigwig_only=(
+            bool(config.get("cleanup", {}).get(
+                "delete_consolidated_predictions", False
+            ))
+            if config is not None else False
+        ),
     ):
         return "COMPLETE"
 
@@ -149,6 +166,7 @@ def build_status_table(
     results_dir,
     work_dir,
     require_tracks,
+    config=None,
 ):
     rows = []
 
@@ -176,6 +194,7 @@ def build_status_table(
                         results_dir,
                         work_dir,
                         require_tracks,
+                        config=config,
                     )
                 ),
             }
@@ -397,13 +416,40 @@ def choose_multiple_species(
             "Search species: "
         ).strip()
 
+        if query.lower() in {"b", "back"}:
+            print("Returning to main menu.")
+            return []
+
         if not query:
             break
 
-        matches = find_species_matches(
-            inventory,
-            query,
-        )
+        if query.lower() in {"list", "all"}:
+            matches = inventory
+
+        elif "," in query:
+            for name in query.split(","):
+                name = name.strip()
+                if not name:
+                    continue
+
+                found = find_species_matches(inventory, name)
+
+                if len(found) == 1:
+                    species_id = str(found.iloc[0]["species_id"])
+                    if species_id not in selected:
+                        selected.append(species_id)
+                        print(f"Added: {species_id}")
+                elif len(found) == 0:
+                    print(f"No matches: {name}")
+                else:
+                    print(
+                        f"Ambiguous: {name}. "
+                        "Search individually."
+                    )
+            continue
+
+        else:
+            matches = find_species_matches(inventory, query)
 
         if len(matches) == 0:
             print(
@@ -451,6 +497,10 @@ def choose_multiple_species(
             "(example: 1,3,5), "
             "'all', or Enter to cancel: "
         ).strip().lower()
+
+        if choice in {"b", "back"}:
+            print("Returning to main menu.")
+            return []
 
         if not choice:
             continue
@@ -546,6 +596,37 @@ def choose_multiple_species(
     return selected
 
 
+
+# AG2_BACK_NAVIGATION_V1
+class BackToMainMenu(Exception):
+    """Cancel the current menu operation."""
+
+
+def _menu_input(prompt):
+    value = input(prompt)
+    if value.strip().lower() in {"b", "back"}:
+        raise BackToMainMenu()
+    return value
+
+
+def _menu_yes_no(prompt, default=False):
+    suffix = " [Y/n]: " if default else " [y/N]: "
+    value = _menu_input(prompt + suffix).strip().lower()
+
+    if not value:
+        return default
+
+    return value in {"y", "yes"}
+
+
+def _menu_call(function, fallback, *args, **kwargs):
+    try:
+        return function(*args, **kwargs)
+    except BackToMainMenu:
+        print("Returning to main menu.")
+        return fallback
+
+
 def choose_taxa(
     inventory,
 ):
@@ -575,7 +656,7 @@ def choose_taxa(
             f"{int(taxa[name])} species"
         )
 
-    selection = input(
+    selection = _menu_input(
         "Choose number: "
     ).strip()
 
@@ -699,7 +780,7 @@ def get_runtime_options(
     multiple,
 ):
     if multiple:
-        raw = input(
+        raw = _menu_input(
             f"Max parallel species "
             f"[{default_parallel}]: "
         ).strip()
@@ -715,12 +796,12 @@ def get_runtime_options(
     else:
         max_parallel = 1
 
-    build_tracks = ask_yes_no(
+    build_tracks = _menu_yes_no(
         "Generate BigWigs?",
         default=True,
     )
 
-    cleanup = ask_yes_no(
+    cleanup = _menu_yes_no(
         "Delete temporary genomes/checkpoints "
         "after successful validation?",
         default=True,
@@ -875,6 +956,12 @@ def interactive_mode(
     config,
     status_df,
 ):
+    # AG2_MENU_REFACTOR_V2
+    config_path = Path(config_path)
+
+    def refresh_status():
+        return build_status_table(inventory, Path(config['paths']['results_dir']), Path(config['paths']['work_dir']), require_tracks=bool(config['outputs'].get('build_bigwig', True)), config=config)
+
     default_parallel = int(
         config[
             "runtime"
@@ -884,6 +971,7 @@ def interactive_mode(
     )
 
     while True:
+        status_df = refresh_status()
         print()
         print("=" * 70)
         print("AlphaGenome 2 Genome Pipeline")
@@ -912,12 +1000,18 @@ def interactive_mode(
 
 
 
-        print("1. Run one species")
-        print("2. Run selected species")
-        print("3. Run one taxonomic group")
-        print("4. Run all unfinished species")
-        print("5. Retry failed species")
-        print("6. Show pipeline status")
+
+        print(
+            f"Active config: {config_path.name} | "
+            f"{config['alphagenome'].get('output_type', 'RNA_SEQ')} | "
+            f"{config['alphagenome'].get('condition', 'n/a')}"
+        )
+        print("1. Run selected species (one or multiple)")
+        print("2. Run one taxonomic group")
+        print("3. Run all unfinished species")
+        print("4. Retry failed species")
+        print("5. Download reference genome(s)")
+        print("6. Configuration & pipeline status")
         print("7. Dry-run / preview")
         print("8. AlphaGenome API key")
         print("9. Exit")
@@ -935,66 +1029,120 @@ def interactive_mode(
            manage_api_key()
            continue
 
-        if choice == "6":
-            print_status_summary(
-                status_df
-            )
 
-            if ask_yes_no(
-                "Show full species table?",
-                default=False,
-            ):
-                print()
-                print(
-                    status_df.to_string(
-                        index=False
+        if choice == "5":
+            downloader = SRC_DIR / "download_reference_genomes.py"
+            if not downloader.is_file():
+                print(f"Downloader not found: {downloader}")
+            else:
+                try:
+                    subprocess.run(
+                        [sys.executable, str(downloader)],
+                        cwd=str(PROJECT_ROOT),
+                        check=True,
                     )
-                )
-
+                except subprocess.CalledProcessError as exc:
+                    print(f"Downloader failed: {exc}")
             continue
+
+        if choice == "6":
+            while True:
+                configs = sorted(
+                    (PROJECT_ROOT / "configs").glob("*.yaml")
+                )
+                print("\nConfiguration & pipeline status")
+                print(f"Active: {config_path.name}")
+
+                for i, file in enumerate(configs, 1):
+                    marker = (
+                        " [ACTIVE]"
+                        if file.resolve() == config_path.resolve()
+                        else ""
+                    )
+                    print(f"{i}. {file.name}{marker}")
+
+                print("s. Show active pipeline status")
+                print("b. Back to main menu (or Enter)")
+
+                answer = input("Selection: ").strip().lower()
+
+                if answer in {"", "b", "back"}:
+                    break
+
+                if answer == "s":
+                    status_df = refresh_status()
+                    print_status_summary(status_df)
+                    if ask_yes_no(
+                        "Show full species table?",
+                        default=False,
+                    ):
+                        print(status_df.to_string(index=False))
+                    continue
+
+                if (
+                    not answer.isdigit()
+                    or not 1 <= int(answer) <= len(configs)
+                ):
+                    print("Invalid selection.")
+                    continue
+
+                target = configs[int(answer) - 1]
+
+                try:
+                    candidate = load_config(target)
+                    candidate["alphagenome"]["output_type"]
+                    candidate["paths"]["results_dir"]
+                    candidate["paths"]["work_dir"]
+                    parallel = int(
+                        candidate["runtime"]["max_parallel_species"]
+                    )
+                except (
+                    KeyError, TypeError, ValueError, OSError
+                ) as exc:
+                    print(f"Invalid configuration: {exc}")
+                    continue
+
+                config_path = target
+                config = candidate
+                default_parallel = parallel
+                status_df = refresh_status()
+
+                print(f"Switched to {config_path.name}")
+                print_status_summary(status_df)
+            continue
+
 
         if choice == "7":
             dry_run = True
-
-            print()
-            print("Preview scope:")
-            print("1. One species")
-            print("2. Selected species")
-            print("3. Taxonomic group")
-            print("4. All unfinished species")
+            print("\nPreview scope:")
+            print("1. Selected species")
+            print("2. Taxonomic group")
+            print("3. All unfinished species")
+            print("4. Retry failed species")
 
             preview_choice = input(
-                "Selection: "
-            ).strip()
+                "Selection (b to go back): "
+            ).strip().lower()
+
+            if preview_choice in {"", "b", "back"}:
+                continue
 
             choice = {
                 "1": "1",
                 "2": "2",
                 "3": "3",
                 "4": "4",
-            }.get(
-                preview_choice,
-                "",
-            )
+            }.get(preview_choice, "")
 
         if choice == "1":
-            selected = [
-                choose_one_species(
-                    inventory
-                )
-            ]
+            selected = choose_multiple_species(inventory)
 
         elif choice == "2":
-            selected = (
-                choose_multiple_species(
-                    inventory
-                )
+            taxa = _menu_call(
+                choose_taxa, None, inventory
             )
-
-        elif choice == "3":
-            taxa = choose_taxa(
-                inventory
-            )
+            if taxa is None:
+                continue
 
             selected = (
                 inventory[
@@ -1015,7 +1163,7 @@ def interactive_mode(
                 f"{len(selected)} species"
             )
 
-        elif choice == "4":
+        elif choice == "3":
             full_inventory = True
 
             unfinished = (
@@ -1035,7 +1183,7 @@ def interactive_mode(
                 .tolist()
             )
 
-        elif choice == "5":
+        elif choice == "4":
             failed = (
                 status_df[
                     status_df[
@@ -1069,12 +1217,17 @@ def interactive_mode(
             max_parallel,
             build_tracks,
             cleanup,
-        ) = get_runtime_options(
+        ) = _menu_call(
+            get_runtime_options,
+            (None, None, None),
             default_parallel,
             multiple=(
                 len(selected) > 1
             ),
         )
+
+        if max_parallel is None:
+            continue
 
         preview_selection(
             selected,
@@ -1144,8 +1297,8 @@ def interactive_mode(
         status_df = (
             build_status_table(
                 inventory,
-                DEFAULT_RESULTS,
-                DEFAULT_WORK,
+                Path(config["paths"]["results_dir"]),
+                Path(config["paths"]["work_dir"]),
                 require_tracks=(
                     bool(
                         config[
@@ -1156,6 +1309,7 @@ def interactive_mode(
                         )
                     )
                 ),
+                config=config,
             )
         )
 
@@ -1279,11 +1433,12 @@ def main():
 
     status_df = build_status_table(
         inventory,
-        DEFAULT_RESULTS,
-        DEFAULT_WORK,
+        Path(config["paths"]["results_dir"]),
+        Path(config["paths"]["work_dir"]),
         require_tracks=(
             default_build_tracks
         ),
+        config=config,
     )
 
     #

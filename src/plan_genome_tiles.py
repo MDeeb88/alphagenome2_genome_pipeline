@@ -205,10 +205,22 @@ def main():
         input_length - retained_length
     ) // 2
 
+    min_contig_length = int(
+        cfg["tiling"].get("min_contig_length", 0)
+    )
+
+    if min_contig_length < 0:
+        raise ValueError(
+            "min_contig_length must be non-negative"
+        )
+
     min_scaffold_length = (
         args.min_scaffold_length
         if args.min_scaffold_length is not None
-        else retained_length
+        else cfg["tiling"].get(
+            "min_contig_length",
+            retained_length,
+        )
     )
 
     species_dir = (
@@ -267,11 +279,14 @@ def main():
             )
             continue
 
-        keep, reason = decide_sequence(
-            record,
-            length,
-            min_scaffold_length,
-        )
+        if length < min_contig_length:
+            keep, reason = False, "short_contig"
+        else:
+            keep, reason = decide_sequence(
+                record,
+                length,
+                min_scaffold_length,
+            )
 
         row = {
             "fasta_name": fasta_name,

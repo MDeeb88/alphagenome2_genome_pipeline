@@ -113,6 +113,31 @@ def main():
             f"Missing manifest: {manifest_path}"
         )
 
+    assay_store = zarr.open_group(
+        str(store_path),
+        mode="r",
+    )
+
+    output_type = str(
+        assay_store.attrs.get("output_type", "RNA_SEQ")
+    ).upper()
+
+    if output_type == "ATAC":
+        from build_tracks_atac import build_atac_tracks
+
+        build_atac_tracks(
+            store_path=store_path,
+            manifest_path=manifest_path,
+            tracks_dir=tracks_dir,
+            force=args.force,
+        )
+        return
+
+    if output_type != "RNA_SEQ":
+        raise ValueError(
+            f"Unsupported output type: {output_type}"
+        )
+
     for path in [
         plus_path,
         minus_path,

@@ -178,7 +178,7 @@ def main():
     parser.add_argument(
         "--results-dir",
         type=Path,
-        default=DEFAULT_RESULTS,
+        default=None,
     )
 
     parser.add_argument(
@@ -212,6 +212,14 @@ def main():
     )
 
     args = parser.parse_args()
+
+    # Resolve results directory from the selected assay config.
+    # An explicit --results-dir overrides the YAML setting.
+    if args.results_dir is None:
+        path_config = load_config(args.config)
+        args.results_dir = Path(
+            path_config["paths"]["results_dir"]
+        )
 
     cfg = load_config(
         args.config

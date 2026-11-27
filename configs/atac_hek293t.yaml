@@ -1,0 +1,56 @@
+project:
+  name: "alphagenome2_genome_pipeline"
+
+alphagenome:
+  condition: "EFO:0001184"
+  output_type: "ATAC"
+  assay_title: "ATAC-seq"
+  imputation_mode: "observed"
+
+tiling:
+  min_contig_length: 100000
+  # AlphaGenome 2 fixed 1 Mb input size.
+  input_length: 1048576
+
+  # Keep only the central 512 kb from each prediction.
+  # This gives every retained base substantial sequence context.
+  retained_length: 524288
+
+  # Pad chromosome ends with N when full context is unavailable.
+  padding: "N"
+
+prediction:
+  api_workers_per_species: 1
+  max_retries: 5
+  retry_seconds: 10
+
+  # Temporary per-tile files make interrupted runs resumable.
+  checkpoint_every: 1
+
+outputs:
+  save_raw_predictions: true
+
+  # Consolidate temporary tile predictions after the species finishes.
+  consolidate_predictions: true
+
+  # Generate IGV-compatible tracks as a derived output.
+  build_bigwig: true
+  build_bedgraph: false
+
+cleanup:
+  delete_consolidated_predictions: true
+  # Delete downloaded FASTA only after successful validation.
+  delete_downloaded_genome: true
+
+  # Delete temporary per-tile prediction files only after consolidation
+  # and validation have succeeded.
+  delete_temporary_predictions: true
+
+runtime:
+  # This will be used later by the multi-species scheduler.
+  max_parallel_species: 5
+
+paths:
+  work_dir: "/media/eternus1/nfs/projects/dpanchenko/alphagenome2_genome_pipeline/work/atac_hek293t"
+  results_dir: "/media/eternus1/nfs/projects/dpanchenko/alphagenome2_genome_pipeline/results/atac_hek293t"
+  logs_dir: "/media/eternus1/nfs/projects/dpanchenko/alphagenome2_genome_pipeline/logs/atac_hek293t"

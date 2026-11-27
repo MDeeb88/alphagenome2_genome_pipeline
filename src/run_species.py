@@ -505,73 +505,232 @@ def consolidation_complete(
 
 def tracks_complete(
     species_results,
+    expected_output_type=None,
+    expected_condition=None,
 ):
-    tracks_dir = (
-        species_results
-        / "tracks"
-    )
-
-    summary_path = (
-        tracks_dir
-        / "track_build_summary.json"
-    )
+    tracks_dir = species_results / "tracks"
 
     summary = read_json(
-        summary_path
+        tracks_dir / "track_build_summary.json"
     )
 
-    if not summary:
+    if not isinstance(summary, dict):
         return False
 
-    if not summary.get(
-        "complete",
-        False,
+    if not (
+        summary.get("complete")
+        and summary.get("validation_passed")
     ):
         return False
 
-    if not summary.get(
-        "validation_passed",
-        False,
+    output_type = str(
+        summary.get("output_type", "RNA_SEQ")
+    ).upper()
+
+    if (
+        expected_output_type is not None
+        and output_type != expected_output_type
     ):
         return False
+
+    if output_type == "ATAC":
+        if (
+            expected_condition is not None
+            and summary.get("condition") != expected_condition
+        ):
+            return False
 
     required = [
-        tracks_dir
-        / "totalRNA_plus.bw",
-
-        tracks_dir
-        / "totalRNA_minus.bw",
-
-        tracks_dir
-        / "chrom.sizes",
-
-        tracks_dir
-        / "chrom_aliases.tsv",
+        tracks_dir / "chrom.sizes",
+        tracks_dir / "chrom_aliases.tsv",
     ]
 
+    if output_type == "RNA_SEQ":
+        required += [
+            tracks_dir / "totalRNA_plus.bw",
+            tracks_dir / "totalRNA_minus.bw",
+        ]
+
+    elif output_type == "ATAC":
+        entries = summary.get("tracks")
+
+        if not isinstance(entries, list) or not entries:
+            return False
+
+        if summary.get("channel_count") != len(entries):
+            return False
+
+        species_id = tracks_dir.parent.name
+
+        if len(entries) == 1:
+            expected_names = [
+                f"{species_id}_HEK293T_ATAC.bw"
+            ]
+        else:
+            expected_names = [
+                f"{species_id}_HEK293T_ATAC_channel_{i + 1:02d}.bw"
+                for i in range(len(entries))
+            ]
+
+        for i, entry in enumerate(entries):
+            if not isinstance(entry, dict):
+                return False
+
+            raw_path = entry.get("path")
+
+            if not isinstance(raw_path, str) or not raw_path:
+                return False
+
+            track_path = Path(raw_path)
+            expected_path = tracks_dir / expected_names[i]
+
+            if track_path.resolve() != expected_path.resolve():
+                return False
+
+            if entry.get("channel") != i:
+                return False
+
+            required.append(track_path)
+
+    else:
+        return False
+
     return all(
-        path.exists()
-        and path.stat().st_size > 0
-        for path in required
+        file.is_file() and file.stat().st_size > 0
+        for file in required
     )
 
 
 def final_outputs_complete(
     species_results,
     require_tracks,
+    expected_output_type=None,
+    expected_condition=None,
+    allow_bigwig_only=False,
 ):
-    if not consolidation_complete(
-        species_results
+    """Validate either full results or approved BigWig-only results."""
+
+    if require_tracks:
+        if not tracks_complete(
+            species_results,
+            expected_output_type=expected_output_type,
+            expected_condition=expected_condition,
+        ):
+            return False
+
+        if allow_bigwig_only:
+            return True
+
+    return consolidation_complete(species_results)
+
+
+
+def remove_validated_atac_zarr(species_results, condition):
+    """Remove ATAC Zarr only after checking its BigWig outputs."""
+    import shutil
+    import numpy as np
+    import pyBigWig
+
+    if not tracks_complete(
+        species_results,
+        expected_output_type="ATAC",
+        expected_condition=condition,
     ):
-        return False
+        raise RuntimeError(
+            "Cannot delete Zarr: ATAC tracks are not complete."
+        )
+
+    if not consolidation_complete(species_results):
+        raise RuntimeError(
+            "Cannot delete Zarr: consolidation is not valid."
+        )
+
+    store_path = (
+        species_results / "predictions" / "predictions.zarr"
+    )
+    tracks_dir = species_results / "tracks"
+
+    root = zarr.open_group(str(store_path), mode="r")
+
+    if root.attrs.get("output_type") != "ATAC":
+        raise RuntimeError("Refusing to delete non-ATAC data.")
+
+    if root.attrs.get("condition") != condition:
+        raise RuntimeError("Zarr condition mismatch.")
+
+    summary = read_json(
+        tracks_dir / "track_build_summary.json"
+    )
+
+    entries = summary["tracks"]
+    n_channels = len(entries)
 
     if (
-        require_tracks
-        and not tracks_complete(
-            species_results
-        )
+        root.attrs.get("track_strands") != ["."] * n_channels
+        or n_channels != summary["channel_count"]
     ):
-        return False
+        raise RuntimeError("ATAC channel metadata mismatch.")
+
+    chrom_sizes = {}
+
+    with (tracks_dir / "chrom.sizes").open() as handle:
+        for line in handle:
+            name, length = line.rstrip("\n").split("\t")
+            chrom_sizes[name] = int(length)
+
+    if not chrom_sizes:
+        raise RuntimeError("No chromosomes in BigWig metadata.")
+
+    if (
+        sum(chrom_sizes.values())
+        != int(root.attrs["selected_bases"])
+    ):
+        raise RuntimeError("Genome coverage mismatch.")
+
+    # Verify each BigWig can be opened and sampled against Zarr.
+    for i, entry in enumerate(entries):
+        bw_path = Path(entry["path"])
+        bw = pyBigWig.open(str(bw_path))
+
+        if bw is None:
+            raise RuntimeError(f"Cannot open BigWig: {bw_path}")
+
+        try:
+            if bw.chroms() != chrom_sizes:
+                raise RuntimeError(
+                    f"Chromosome mismatch: {bw_path}"
+                )
+
+            for chromosome, length in chrom_sizes.items():
+                values = root["sequences"][chromosome]["values"]
+
+                for pos in sorted({0, length // 2, length - 1}):
+                    expected = float(values[pos:pos + 1, i][0])
+                    actual = bw.values(
+                        chromosome, pos, pos + 1
+                    )[0]
+
+                    if not np.isclose(
+                        expected,
+                        actual,
+                        rtol=0,
+                        atol=1e-6,
+                    ):
+                        raise RuntimeError(
+                            f"BigWig mismatch at "
+                            f"{chromosome}:{pos}, channel {i}"
+                        )
+        finally:
+            bw.close()
+
+    # Every check has passed.
+    del root
+    shutil.rmtree(store_path)
+
+    print(
+        "Validated ATAC Zarr removed successfully:",
+        store_path,
+    )
 
     return True
 
@@ -720,13 +879,13 @@ def main():
     parser.add_argument(
         "--work-dir",
         type=Path,
-        default=DEFAULT_WORK,
+        default=None,
     )
 
     parser.add_argument(
         "--results-dir",
         type=Path,
-        default=DEFAULT_RESULTS,
+        default=None,
     )
 
     parser.add_argument(
@@ -765,6 +924,37 @@ def main():
     cfg = load_yaml(
         args.config
     )
+
+    args.work_dir = (
+        args.work_dir
+        if args.work_dir is not None
+        else Path(cfg["paths"]["work_dir"])
+    )
+
+    args.results_dir = (
+        args.results_dir
+        if args.results_dir is not None
+        else Path(cfg["paths"]["results_dir"])
+    )
+
+    expected_output_type = str(
+        cfg["alphagenome"].get("output_type", "RNA_SEQ")
+    ).upper()
+
+    expected_condition = str(
+        cfg["alphagenome"]["condition"]
+    )
+
+    allow_bigwig_only = bool(
+        cfg.get("cleanup", {}).get(
+            "delete_consolidated_predictions", False
+        )
+    )
+
+    if expected_output_type not in {"RNA_SEQ", "ATAC"}:
+        raise ValueError(
+            f"Unsupported output type: {expected_output_type}"
+        )
 
     species_row, accession = (
         load_species_row(
@@ -920,6 +1110,9 @@ def main():
         and final_outputs_complete(
             species_results,
             require_tracks=build_tracks,
+            expected_output_type=expected_output_type,
+            expected_condition=expected_condition,
+            allow_bigwig_only=allow_bigwig_only,
         )
     ):
         status[
@@ -1389,6 +1582,9 @@ def main():
         if not final_outputs_complete(
             species_results,
             require_tracks=build_tracks,
+            expected_output_type=expected_output_type,
+            expected_condition=expected_condition,
+            allow_bigwig_only=allow_bigwig_only,
         ):
             raise RuntimeError(
                 "Final permanent-output validation failed."
@@ -1448,6 +1644,18 @@ def main():
                     True,
                 )
             )
+
+            if allow_bigwig_only:
+                if expected_output_type != "ATAC" or not build_tracks:
+                    raise RuntimeError(
+                        "BigWig-only cleanup requires ATAC "
+                        "and enabled BigWig generation."
+                    )
+
+                remove_validated_atac_zarr(
+                    species_results,
+                    expected_condition,
+                )
 
             cleanup_work(
                 species_work=species_work,

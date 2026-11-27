@@ -42,7 +42,37 @@ def tile_filename(row):
     )
 
 
-def load_and_validate_tile(path, row):
+
+def checkpoint_signature(x):
+    """Identify the assay and selected channels of a checkpoint."""
+    required = {
+        "condition", "assay_title", "imputation_mode",
+        "track_strands",
+    }
+    missing = required - set(x.files)
+    if missing:
+        raise RuntimeError(
+            f"Checkpoint metadata missing: {sorted(missing)}"
+        )
+
+    def scalar(name, default=""):
+        return str(x[name].item()) if name in x.files else default
+
+    return {
+        "output_type": scalar("output_type", "RNA_SEQ"),
+        "condition": scalar("condition"),
+        "assay_title": scalar("assay_title"),
+        "imputation_mode": scalar("imputation_mode"),
+        "endedness": scalar("endedness"),
+        "track_strands": [str(v) for v in x["track_strands"]],
+        "track_indices": (
+            [int(v) for v in x["track_indices"]]
+            if "track_indices" in x.files else []
+        ),
+    }
+
+
+def load_and_validate_tile(path, row, expected_signature=None):
     if not path.exists():
         raise FileNotFoundError(
             f"Missing prediction tile: {path}"
@@ -80,14 +110,15 @@ def load_and_validate_tile(path, row):
             row["retained_length"]
         )
 
-        if values.shape != (
-            expected_length,
-            2,
+        if (
+            values.ndim != 2
+            or values.shape[0] != expected_length
+            or values.shape[1] < 1
         ):
             raise RuntimeError(
-                f"{path.name}: values shape "
-                f"{values.shape} != "
-                f"({expected_length}, 2)"
+                f"{path.name}: invalid values shape "
+                f"{values.shape}; expected "
+                f"({expected_length}, channels>=1)"
             )
 
         if not np.all(
@@ -102,10 +133,47 @@ def load_and_validate_tile(path, row):
             for v in x["track_strands"]
         ]
 
-        if strands != ["+", "-"]:
+        output_type = (
+            str(x["output_type"].item())
+            if "output_type" in x.files
+            else "RNA_SEQ"
+        )
+
+        if len(strands) != values.shape[1]:
             raise RuntimeError(
-                f"{path.name}: unexpected strands "
-                f"{strands}"
+                f"{path.name}: number of strand labels "
+                "does not match the channel count."
+            )
+
+        if output_type == "RNA_SEQ":
+            if strands != ["+", "-"]:
+                raise RuntimeError(
+                    f"{path.name}: invalid RNA strands "
+                    f"{strands}"
+                )
+
+        elif output_type == "ATAC":
+            if any(strand != "." for strand in strands):
+                raise RuntimeError(
+                    f"{path.name}: ATAC tracks must be "
+                    f"unstranded; found {strands}"
+                )
+
+            if "track_indices" not in x.files:
+                raise RuntimeError(
+                    f"{path.name}: missing ATAC channel indices"
+                )
+
+            if len(x["track_indices"]) != values.shape[1]:
+                raise RuntimeError(
+                    f"{path.name}: ATAC channel index "
+                    "count mismatch"
+                )
+
+        else:
+            raise RuntimeError(
+                f"{path.name}: unsupported output type "
+                f"{output_type}"
             )
 
         orientation = str(
@@ -117,6 +185,14 @@ def load_and_validate_tile(path, row):
                 f"{path.name}: unexpected orientation "
                 f"{orientation}"
             )
+
+        if expected_signature is not None:
+            actual_signature = checkpoint_signature(x)
+            if actual_signature != expected_signature:
+                raise RuntimeError(
+                    f"{path.name}: assay/channel metadata differs "
+                    "from the first checkpoint."
+                )
 
         checks = {
             "tile_index": (
@@ -434,6 +510,31 @@ def main():
     #
     # Zarr v3 store.
     #
+    if manifest.empty:
+        raise RuntimeError("Cannot consolidate an empty manifest.")
+
+    first_row = manifest.iloc[0].to_dict()
+    first_path = tile_dir / tile_filename(first_row)
+
+    with np.load(first_path, allow_pickle=False) as x:
+        signature = checkpoint_signature(x)
+
+    output_type = signature["output_type"]
+    track_strands = signature["track_strands"]
+    n_channels = len(track_strands)
+
+    if output_type not in {"RNA_SEQ", "ATAC"}:
+        raise RuntimeError(f"Unsupported assay: {output_type}")
+
+    if n_channels < 1:
+        raise RuntimeError("No prediction channels found.")
+
+    load_and_validate_tile(first_path, first_row, signature)
+
+    print(f"Assay:         {output_type}")
+    print(f"Channels:      {n_channels}")
+    print(f"Condition:     {signature['condition']}")
+
     root = zarr.open_group(
         str(temp_store),
         mode="w",
@@ -449,7 +550,12 @@ def main():
             ),
             "zarr_format": 3,
             "dtype": "float32",
-            "track_strands": ["+", "-"],
+            "track_strands": track_strands,
+            "track_indices": signature["track_indices"],
+            "output_type": output_type,
+            "condition": signature["condition"],
+            "assay_title": signature["assay_title"],
+            "imputation_mode": signature["imputation_mode"],
             "track_orientation": (
                 "genomic_reference"
             ),
@@ -556,10 +662,7 @@ def main():
                 "sequence_length": (
                     sequence_length
                 ),
-                "track_strands": [
-                    "+",
-                    "-",
-                ],
+                "track_strands": track_strands,
             }
         )
 
@@ -573,12 +676,12 @@ def main():
                 "values",
                 shape=(
                     sequence_length,
-                    2,
+                    n_channels,
                 ),
                 dtype="float32",
                 chunks=(
                     chunk_bases,
-                    2,
+                    n_channels,
                 ),
                 compressors=[
                     compressor
@@ -587,13 +690,9 @@ def main():
             )
         )
 
-        plus_min = np.inf
-        plus_max = -np.inf
-        plus_sum = 0.0
-
-        minus_min = np.inf
-        minus_max = -np.inf
-        minus_sum = 0.0
+        channel_min = np.full(n_channels, np.inf)
+        channel_max = np.full(n_channels, -np.inf)
+        channel_sum = np.zeros(n_channels, dtype=np.float64)
 
         bases_written = 0
 
@@ -609,6 +708,7 @@ def main():
                 load_and_validate_tile(
                     path,
                     row,
+                    signature,
                 )
             )
 
@@ -648,39 +748,14 @@ def main():
                     f"{start}-{end}"
                 )
 
-            plus = values[:, 0]
-            minus = values[:, 1]
-
-            plus_min = min(
-                plus_min,
-                float(plus.min()),
+            channel_min = np.minimum(
+                channel_min, values.min(axis=0)
             )
-
-            plus_max = max(
-                plus_max,
-                float(plus.max()),
+            channel_max = np.maximum(
+                channel_max, values.max(axis=0)
             )
-
-            plus_sum += float(
-                plus.sum(
-                    dtype=np.float64
-                )
-            )
-
-            minus_min = min(
-                minus_min,
-                float(minus.min()),
-            )
-
-            minus_max = max(
-                minus_max,
-                float(minus.max()),
-            )
-
-            minus_sum += float(
-                minus.sum(
-                    dtype=np.float64
-                )
+            channel_sum += values.sum(
+                axis=0, dtype=np.float64
             )
 
             bases_written += len(
@@ -729,6 +804,29 @@ def main():
                     f"in {start}-{end}"
                 )
 
+        if output_type == "RNA_SEQ":
+            statistics = {
+                "plus_min": float(channel_min[0]),
+                "plus_max": float(channel_max[0]),
+                "plus_mean": float(channel_sum[0] / sequence_length),
+                "minus_min": float(channel_min[1]),
+                "minus_max": float(channel_max[1]),
+                "minus_mean": float(channel_sum[1] / sequence_length),
+            }
+        else:
+            statistics = {}
+            for channel in range(n_channels):
+                prefix = f"channel_{channel}"
+                statistics[f"{prefix}_min"] = float(
+                    channel_min[channel]
+                )
+                statistics[f"{prefix}_max"] = float(
+                    channel_max[channel]
+                )
+                statistics[f"{prefix}_mean"] = float(
+                    channel_sum[channel] / sequence_length
+                )
+
         sequence_stats.append(
             {
                 "fasta_name": fasta_name,
@@ -751,26 +849,7 @@ def main():
                 "tile_count": int(
                     len(group_rows)
                 ),
-                "plus_min": float(
-                    plus_min
-                ),
-                "plus_max": float(
-                    plus_max
-                ),
-                "plus_mean": float(
-                    plus_sum
-                    / sequence_length
-                ),
-                "minus_min": float(
-                    minus_min
-                ),
-                "minus_max": float(
-                    minus_max
-                ),
-                "minus_mean": float(
-                    minus_sum
-                    / sequence_length
-                ),
+                **statistics,
             }
         )
 
@@ -818,7 +897,7 @@ def main():
 
     uncompressed_bytes = (
         selected_bases
-        * 2
+        * n_channels
         * np.dtype(
             np.float32
         ).itemsize
@@ -828,10 +907,13 @@ def main():
         "species_id": args.species,
         "complete": True,
         "zarr_format": 3,
-        "track_strands": [
-            "+",
-            "-",
-        ],
+        "track_strands": track_strands,
+        "track_indices": signature["track_indices"],
+        "channel_count": n_channels,
+        "output_type": output_type,
+        "condition": signature["condition"],
+        "assay_title": signature["assay_title"],
+        "imputation_mode": signature["imputation_mode"],
         "track_orientation": (
             "genomic_reference"
         ),
